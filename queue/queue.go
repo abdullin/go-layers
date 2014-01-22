@@ -27,7 +27,23 @@ func New(sub subspace.Subspace, highContention bool) Queue {
 }
 
 func (queue *Queue) Clear(tr fdb.Transaction) {
-	tr.Clear(queue.Subspace.AsFoundationDbKey())
+	tr.ClearRange(queue.Subspace.FullRange())
+}
+
+func (queue *Queue) Peek(tr fdb.Transaction) ([]byte, error) {
+	val, ok := queue.getFirstItem(tr)
+	if ok {
+		return decodeValue(val.Value)
+	}
+	return nil, nil
+}
+
+func decodeValue(val []byte) ([]byte, error) {
+	t, ok := tuple.Unpack(val)
+	return t[0].([]byte), ok
+}
+func encodeValue(value []byte) []byte {
+	return tuple.Tuple{value}.Pack()
 }
 
 type KeyReader interface {
@@ -62,7 +78,9 @@ func (queue *Queue) Push(tr fdb.Transaction, value []byte) {
 }
 func (queue *Queue) pushAt(tr fdb.Transaction, value []byte, index int64) {
 	key := queue.queueItem.Pack(tuple.Tuple{index, nextRandom()})
-	tr.Set(fdb.Key(key), value)
+	val := encodeValue(value)
+
+	tr.Set(fdb.Key(key), val)
 }
 
 func nextRandom() []byte {
