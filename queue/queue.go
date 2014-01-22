@@ -30,17 +30,21 @@ func (queue *Queue) Clear(tr fdb.Transaction) {
 	tr.ClearRange(queue.Subspace.FullRange())
 }
 
-func (queue *Queue) Peek(tr fdb.Transaction) ([]byte, error) {
-	val, ok := queue.getFirstItem(tr)
-	if ok {
-		return decodeValue(val.Value)
+func (queue *Queue) Peek(tr fdb.Transaction) (value []byte, ok bool) {
+	if val, ok := queue.getFirstItem(tr); ok {
+		return decodeValue(val.Value), true
 	}
-	return nil, nil
+	return
+
 }
 
-func decodeValue(val []byte) ([]byte, error) {
-	t, ok := tuple.Unpack(val)
-	return t[0].([]byte), ok
+func decodeValue(val []byte) []byte {
+	if t, err := tuple.Unpack(val); err != nil {
+		panic(err)
+	} else {
+		return t[0].([]byte)
+	}
+
 }
 func encodeValue(value []byte) []byte {
 	return tuple.Tuple{value}.Pack()
@@ -83,6 +87,16 @@ func (queue *Queue) pushAt(tr fdb.Transaction, value []byte, index int64) {
 	tr.Set(fdb.Key(key), val)
 }
 
+// popSimple does not attempt to avoid conflicts
+// if many clients are trying to pop simultaneously, only one will be able to succeed at a time.
+func (queue *Queue) popSimple(tr fdb.Transaction) (value []byte, ok bool) {
+	if kv, ok := queue.getFirstItem(tr); ok {
+		tr.Clear(kv.Key)
+		return kv.Value, true
+	}
+	return
+}
+
 func nextRandom() []byte {
 	b := make([]byte, 20)
 	if _, err := rand.Read(b); err == nil {
@@ -95,16 +109,15 @@ func nextRandom() []byte {
 
 func (queue *Queue) Empty(tr fdb.Transaction) bool {
 	_, ok := queue.getFirstItem(tr)
-	return !ok
+	return ok == false
 }
 
-func (queue *Queue) getFirstItem(tr fdb.Transaction) (fdb.KeyValue, bool) {
+func (queue *Queue) getFirstItem(tr fdb.Transaction) (kv fdb.KeyValue, ok bool) {
 	r := queue.queueItem.FullRange()
-	res := tr.GetRange(r, fdb.RangeOptions{Limit: 1}).GetSliceOrPanic()
+	opt := fdb.RangeOptions{Limit: 1}
 
-	if len(res) == 0 {
-		return fdb.KeyValue{}, false
+	if kvs := tr.GetRange(r, opt).GetSliceOrPanic(); len(kvs) == 1 {
+		return kvs[0], true
 	}
-
-	return res[0], true
+	return
 }
