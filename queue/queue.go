@@ -80,6 +80,20 @@ func (queue *Queue) Push(tr fdb.Transaction, value []byte) {
 	index := queue.GetNextIndex(snap, queue.queueItem)
 	queue.pushAt(tr, value, index)
 }
+
+// Pop the next item from the queue. Cannot be composed with other functions in a single transaction.
+func (queue *Queue) Pop(tr fdb.Transaction) (value []byte, ok bool) {
+	if queue.HighContention {
+		panic("Not implemented")
+	} else {
+		if result, ok := queue.popSimple(tr); ok {
+			return decodeValue(result), true
+		}
+	}
+	return
+
+}
+
 func (queue *Queue) pushAt(tr fdb.Transaction, value []byte, index int64) {
 	key := queue.queueItem.Pack(tuple.Tuple{index, nextRandom()})
 	val := encodeValue(value)
