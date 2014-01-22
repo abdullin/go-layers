@@ -82,16 +82,29 @@ func (queue *Queue) Push(tr fdb.Transaction, value []byte) {
 }
 
 // Pop the next item from the queue. Cannot be composed with other functions in a single transaction.
-func (queue *Queue) Pop(tr fdb.Transaction) (value []byte, ok bool) {
-	if queue.HighContention {
-		panic("Not implemented")
-	} else {
-		if result, ok := queue.popSimple(tr); ok {
-			return decodeValue(result), true
-		}
+func (queue *Queue) Pop(db fdb.Database) (value []byte, ok bool) {
+	ret, err := db.Transact(func(tr fdb.Transaction) (interface{}, error) {
+		return queue.popInner(tr)
+	})
+
+	if err == nil {
+		return ret.([]byte), true
 	}
 	return
 
+}
+
+func (queue *Queue) popInner(tr fdb.Transaction) (value []byte, err error) {
+	if queue.HighContention {
+		if result, ok := queue.popHighContention(tr); ok {
+			return decodeValue(result), nil
+		}
+	} else {
+		if result, ok := queue.popSimple(tr); ok {
+			return decodeValue(result), nil
+		}
+	}
+	return
 }
 
 func (queue *Queue) pushAt(tr fdb.Transaction, value []byte, index int64) {
@@ -109,6 +122,16 @@ func (queue *Queue) popSimple(tr fdb.Transaction) (value []byte, ok bool) {
 		return kv.Value, true
 	}
 	return
+}
+
+// popHighContention attempts to avoid collisions by registering
+// itself in a semi-ordered set of poppers if it doesn't initially succeed.
+// It then enters a polling loop where it attempts to fulfill outstanding pops
+// and then checks to see if it has been fulfilled.
+func (queue *Queue) popHighContention(tr fdb.Transaction) (value []byte, ok bool) {
+	//panic("Not implemented")
+	//backoff := 0.01
+	return nil, false
 }
 
 func nextRandom() []byte {
