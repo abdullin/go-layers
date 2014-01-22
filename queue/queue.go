@@ -7,6 +7,7 @@ import (
 	"github.com/FoundationDB/fdb-go/fdb"
 	"github.com/FoundationDB/fdb-go/fdb/tuple"
 	"github.com/happypancake/go-layers/subspace"
+	"time"
 )
 
 type Queue struct {
@@ -83,26 +84,24 @@ func (queue *Queue) Push(tr fdb.Transaction, value []byte) {
 
 // Pop the next item from the queue. Cannot be composed with other functions in a single transaction.
 func (queue *Queue) Pop(db fdb.Database) (value []byte, ok bool) {
-	ret, err := db.Transact(func(tr fdb.Transaction) (interface{}, error) {
-		return queue.popInner(tr)
-	})
 
-	if err == nil {
-		return ret.([]byte), true
-	}
-	return
-
-}
-
-func (queue *Queue) popInner(tr fdb.Transaction) (value []byte, err error) {
 	if queue.HighContention {
-		if result, ok := queue.popHighContention(tr); ok {
-			return decodeValue(result), nil
+		if result, ok := queue.popHighContention(db); ok {
+			return decodeValue(result), true
 		}
 	} else {
-		if result, ok := queue.popSimple(tr); ok {
-			return decodeValue(result), nil
+
+		val, _ := db.Transact(func(tr fdb.Transaction) (interface{}, error) {
+			if result, ok := queue.popSimple(tr); ok {
+				return decodeValue(result), nil
+			}
+			return nil, nil
+
+		})
+		if val != nil {
+			return val.([]byte), true
 		}
+
 	}
 	return
 }
@@ -121,6 +120,7 @@ func (queue *Queue) popSimple(tr fdb.Transaction) (value []byte, ok bool) {
 		tr.Clear(kv.Key)
 		return kv.Value, true
 	}
+
 	return
 }
 
@@ -157,21 +157,54 @@ func (queue *Queue) popSimpleOrRegisterWaitKey(tr fdb.Transaction) (value []byte
 // itself in a semi-ordered set of poppers if it doesn't initially succeed.
 // It then enters a polling loop where it attempts to fulfill outstanding pops
 // and then checks to see if it has been fulfilled.
-func (queue *Queue) popHighContention(tr fdb.Transaction) (value []byte, ok bool) {
+func (queue *Queue) popHighContention(db fdb.Database) (value []byte, ok bool) {
 	//panic("Not implemented")
-	//backoff := 0.01
+	backoff := 0.01
 
-	var waitKey []byte
+	tr, err := db.CreateTransaction()
 
-	if value, waitKey := queue.popSimpleOrRegisterWaitKey(tr); value == nil {
+	if err != nil {
+		panic(err)
+	}
+
+	value, waitKey := queue.popSimpleOrRegisterWaitKey(tr)
+	if value != nil {
 		return value, true
 	}
 
 	randId := queue.conflictedPop.MustUnpack(waitKey)[1].([]byte)
 	// The result of the pop will be stored at this key once it has been fulfilled
-	resultKey := queue.conflictedItem.Item(tuple.Tuple{randId})
+	resultKey := queue.conflictedItemKey(randId)
 
 	tr.Reset()
+
+	for {
+		for done := queue.fulfilConflictedPops(db); !done; {
+
+		}
+
+		tr.Reset()
+		value := tr.Get(fdb.Key(waitKey))
+		result := tr.Get(fdb.Key(resultKey))
+
+		// If waitKey is present, then we have not been fulfilled
+		if value.IsReady() {
+			time.Sleep(time.Duration(backoff) * time.Second)
+			backoff = backoff * 2
+			if backoff > 1 {
+				backoff = 1
+			}
+			continue
+		}
+		if !result.IsReady() {
+			return nil, false
+		}
+		tr.Clear(fdb.Key(resultKey))
+		tr.Commit().BlockUntilReady()
+
+		return result.GetOrPanic(), true
+
+	}
 
 	return nil, false
 }
@@ -228,6 +261,11 @@ func (queue *Queue) fulfilConflictedPops(db fdb.Database) bool {
 		return len(pops) < numPops, nil
 
 	})
+
+	if err != nil {
+		panic(err)
+	}
+
 	return v.(bool)
 }
 
