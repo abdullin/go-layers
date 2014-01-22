@@ -53,6 +53,16 @@ func (space Subspace) Unpack(key fdb.Key) (tuple.Tuple, error) {
 
 	return tuple.Unpack(key[l:])
 }
+
+func (space Subspace) MustUnpack(key fdb.Key) tuple.Tuple {
+	if t, err := space.Unpack(key); err == nil {
+		panic(err)
+	} else {
+		return t
+	}
+
+}
+
 func (space Subspace) Pack(tuple tuple.Tuple) []byte {
 	return concat(space.RawPrefix, tuple.Pack())
 }

@@ -124,6 +124,35 @@ func (queue *Queue) popSimple(tr fdb.Transaction) (value []byte, ok bool) {
 	return
 }
 
+func (queue *Queue) addConflictedPop(tr fdb.Transaction, forced bool) (val []byte, ok bool) {
+	index := queue.GetNextIndex(tr.Snapshot(), queue.conflictedPop)
+
+	if index == 0 && !forced {
+		return nil, false
+	}
+	key := queue.conflictedPop.Pack(tuple.Tuple{index, nextRandom()})
+	//read := tr.Get(key)
+	tr.Set(fdb.Key(key), []byte(""))
+	return key, true
+}
+
+func (queue *Queue) popSimpleOrRegisterWaitKey(tr fdb.Transaction) (value []byte, waitKey []byte) {
+
+	// TODO: deal with FDB error in defer
+
+	// Check if there are other people waiting to be popped. If so, we
+	// cannot pop before them.
+	if key, ok := queue.addConflictedPop(tr, false); ok {
+		tr.Commit().BlockUntilReady()
+		return nil, key
+	} else {
+		// No one else was waiting to be popped
+		value, ok = queue.popSimple(tr)
+		tr.Commit().BlockUntilReady()
+		return value, nil
+	}
+}
+
 // popHighContention attempts to avoid collisions by registering
 // itself in a semi-ordered set of poppers if it doesn't initially succeed.
 // It then enters a polling loop where it attempts to fulfill outstanding pops
@@ -131,7 +160,75 @@ func (queue *Queue) popSimple(tr fdb.Transaction) (value []byte, ok bool) {
 func (queue *Queue) popHighContention(tr fdb.Transaction) (value []byte, ok bool) {
 	//panic("Not implemented")
 	//backoff := 0.01
+
+	var waitKey []byte
+
+	if value, waitKey := queue.popSimpleOrRegisterWaitKey(tr); value == nil {
+		return value, true
+	}
+
+	randId := queue.conflictedPop.MustUnpack(waitKey)[1].([]byte)
+	// The result of the pop will be stored at this key once it has been fulfilled
+	resultKey := queue.conflictedItem.Item(tuple.Tuple{randId})
+
+	tr.Reset()
+
 	return nil, false
+}
+
+func (queue *Queue) getWaitingPops(tr fdb.Transaction, numPops int) fdb.RangeResult {
+	r := queue.conflictedPop.FullRange()
+	return tr.GetRange(r, fdb.RangeOptions{Limit: numPops})
+}
+
+func (queue *Queue) getItems(tr fdb.Transaction, numPops int) fdb.RangeResult {
+	r := queue.queueItem.FullRange()
+	return tr.GetRange(r, fdb.RangeOptions{Limit: numPops})
+}
+
+func minLength(a, b []fdb.KeyValue) int {
+	if al, bl := len(a), len(b); al < bl {
+		return al
+	} else {
+		return bl
+	}
+
+}
+
+func (queue *Queue) conflictedItemKey(subkey []byte) []byte {
+	return queue.conflictedItem.Pack(tuple.Tuple{subkey})
+}
+
+func (queue *Queue) fulfilConflictedPops(db fdb.Database) bool {
+	numPops := 100
+
+	v, err := db.Transact(func(tr fdb.Transaction) (interface{}, error) {
+		pops := queue.getWaitingPops(tr, numPops).GetSliceOrPanic()
+		items := queue.getItems(tr, numPops).GetSliceOrPanic()
+
+		min := minLength(pops, items)
+
+		for i := 0; i < min; i++ {
+			pop, k, v := pops[i], items[i].Key, items[i].Value
+
+			key := queue.conflictedPop.MustUnpack(pop.Key)
+			storageKey := queue.conflictedItemKey(key[0].([]byte))
+			tr.Set(fdb.Key(storageKey), v)
+			_ = tr.Get(k)
+			_ = tr.Get(pop.Key)
+			tr.Clear(pop.Key)
+			tr.Clear(k)
+		}
+
+		for _, pop := range pops[min:] {
+			_ = tr.Get(pop.Key)
+			tr.Clear(pop.Key)
+		}
+
+		return len(pops) < numPops, nil
+
+	})
+	return v.(bool)
 }
 
 func nextRandom() []byte {
