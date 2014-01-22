@@ -43,6 +43,10 @@ func (space Subspace) Range(tuple tuple.Tuple) fdb.KeyRange {
 	return fdb.KeyRange{fdb.Key(begin), fdb.Key(end)}
 }
 
+func (space Subspace) FullRange() fdb.KeyRange {
+	return space.Range(tuple.Tuple{})
+}
+
 func (space Subspace) Unpack(key fdb.Key) (tuple.Tuple, error) {
 
 	l := len(space.RawPrefix)
@@ -51,5 +55,4 @@ func (space Subspace) Unpack(key fdb.Key) (tuple.Tuple, error) {
 }
 func (space Subspace) Pack(tuple tuple.Tuple) []byte {
 	return concat(space.RawPrefix, tuple.Pack())
-
 }

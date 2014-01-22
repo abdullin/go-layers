@@ -74,3 +74,19 @@ func nextRandom() []byte {
 		panic(err)
 	}
 }
+
+func (queue *Queue) Empty(tr fdb.Transaction) bool {
+	_, ok := queue.getFirstItem(tr)
+	return !ok
+}
+
+func (queue *Queue) getFirstItem(tr fdb.Transaction) (fdb.KeyValue, bool) {
+	r := queue.queueItem.FullRange()
+	res := tr.GetRange(r, fdb.RangeOptions{Limit: 1}).GetSliceOrPanic()
+
+	if len(res) == 0 {
+		return fdb.KeyValue{}, false
+	}
+
+	return res[0], true
+}
