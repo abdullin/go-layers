@@ -55,7 +55,7 @@ func (space Subspace) Unpack(key fdb.Key) (tuple.Tuple, error) {
 }
 
 func (space Subspace) MustUnpack(key fdb.Key) tuple.Tuple {
-	if t, err := space.Unpack(key); err == nil {
+	if t, err := space.Unpack(key); err != nil {
 		panic(err)
 	} else {
 		return t
