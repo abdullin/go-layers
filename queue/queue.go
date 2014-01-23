@@ -13,7 +13,7 @@ import (
 type Queue struct {
 	Subspace       subspace.Subspace
 	HighContention bool
-	conflictedPop  subspace.Subspace
+	conflictedPop  subspace.Subspace // stores int64 index, randId []byte
 	conflictedItem subspace.Subspace
 	queueItem      subspace.Subspace
 }
@@ -28,6 +28,7 @@ func New(sub subspace.Subspace, highContention bool) Queue {
 }
 
 func (queue *Queue) Clear(tr fdb.Transaction) {
+
 	tr.ClearRange(queue.Subspace.FullRange())
 }
 
@@ -124,33 +125,17 @@ func (queue *Queue) popSimple(tr fdb.Transaction) (value []byte, ok bool) {
 	return
 }
 
-func (queue *Queue) addConflictedPop(tr fdb.Transaction, forced bool) (val []byte, ok bool) {
+func (queue *Queue) addConflictedPop(tr fdb.Transaction, forced bool) (val []byte) {
 	index := queue.GetNextIndex(tr.Snapshot(), queue.conflictedPop)
 
-	if index == 0 && !forced {
-		return nil, false
+	if (index == 0) && (!forced) {
+		return nil
 	}
 	key := queue.conflictedPop.Pack(tuple.Tuple{index, nextRandom()})
-	//read := tr.Get(key)
+	// why do we read no
+	_ = tr.Get(fdb.Key(key))
 	tr.Set(fdb.Key(key), []byte(""))
-	return key, true
-}
-
-func (queue *Queue) popSimpleOrRegisterWaitKey(tr fdb.Transaction) (value []byte, waitKey []byte) {
-
-	// TODO: deal with FDB error in defer
-
-	// Check if there are other people waiting to be popped. If so, we
-	// cannot pop before them.
-	if key, ok := queue.addConflictedPop(tr, false); ok {
-		tr.Commit().BlockUntilReady()
-		return nil, key
-	} else {
-		// No one else was waiting to be popped
-		value, ok = queue.popSimple(tr)
-		tr.Commit().BlockUntilReady()
-		return value, nil
-	}
+	return key
 }
 
 // popHighContention attempts to avoid collisions by registering
@@ -167,9 +152,26 @@ func (queue *Queue) popHighContention(db fdb.Database) (value []byte, ok bool) {
 		panic(err)
 	}
 
-	value, waitKey := queue.popSimpleOrRegisterWaitKey(tr)
-	if value != nil {
-		return value, true
+	// Check if there are other people waiting to be popped. If so, we
+	// cannot pop before them.
+
+	waitKey := queue.addConflictedPop(tr, false)
+	if waitKey == nil {
+		value, ok := queue.popSimple(tr)
+
+		// if we managed to commit without collisions
+		if err := tr.Commit().GetWithError(); err == nil {
+
+			return value, ok
+		}
+	}
+
+	if err := tr.Commit().GetWithError(); err != nil {
+		fmt.Println("Panic in #", err)
+	}
+
+	if waitKey == nil {
+		waitKey = queue.addConflictedPop(tr, true)
 	}
 
 	randId := queue.conflictedPop.MustUnpack(waitKey)[1].([]byte)
@@ -245,7 +247,7 @@ func (queue *Queue) fulfilConflictedPops(db fdb.Database) bool {
 			pop, k, v := pops[i], items[i].Key, items[i].Value
 
 			key := queue.conflictedPop.MustUnpack(pop.Key)
-			storageKey := queue.conflictedItemKey(key[0].([]byte))
+			storageKey := queue.conflictedItemKey(key[1].([]byte))
 			tr.Set(fdb.Key(storageKey), v)
 			_ = tr.Get(k)
 			_ = tr.Get(pop.Key)
@@ -274,7 +276,7 @@ func nextRandom() []byte {
 	if _, err := rand.Read(b); err == nil {
 		return b
 	} else {
-		fmt.Println("Panic", err)
+
 		panic(err)
 	}
 }
