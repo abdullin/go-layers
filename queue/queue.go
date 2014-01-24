@@ -1,3 +1,20 @@
+/*
+Package queue provides a high-contention queue class. It is a part of
+FoundationDb layer.
+
+Queue has two operating modes. The high contention mode (default) is
+designed for environments where many clients will be popping the queue
+simultaneously. Pop operations in this mode are slower when performed in
+isolation, but their performance scales much better with the number of
+popping clients.
+
+If high contention mode is off, then no attempt will be made to avoid
+transaction conflicts in pop operations. This mode performs well with
+only one popping client, but will not scale well to many popping clients.
+
+This code is a port from official python layer
+*/
+
 package queue
 
 import (
@@ -18,6 +35,7 @@ type Queue struct {
 	queueItem      subspace.Subspace
 }
 
+// New queue is created within a given subspace
 func New(sub subspace.Subspace, highContention bool) Queue {
 
 	conflict := sub.Item(tuple.Tuple{"conflict"})
@@ -27,11 +45,12 @@ func New(sub subspace.Subspace, highContention bool) Queue {
 	return Queue{sub, highContention, pop, conflict, item}
 }
 
+// Clear all items from the queue
 func (queue *Queue) Clear(tr fdb.Transaction) {
-
 	tr.ClearRange(queue.Subspace.FullRange())
 }
 
+// Peek at value of the next item without popping it
 func (queue *Queue) Peek(tr fdb.Transaction) (value []byte, ok bool) {
 	if val, ok := queue.getFirstItem(tr); ok {
 		return decodeValue(val.Value), true
@@ -77,13 +96,16 @@ func (queue *Queue) GetNextIndex(tr KeyReader, sub subspace.Subspace) int64 {
 func (queue *Queue) GetNextQueueIndex(tr fdb.Transaction) int64 {
 	return queue.GetNextIndex(tr.Snapshot(), queue.queueItem)
 }
+
+// Push a single item onto the queue
 func (queue *Queue) Push(tr fdb.Transaction, value []byte) {
 	snap := tr.Snapshot()
 	index := queue.GetNextIndex(snap, queue.queueItem)
 	queue.pushAt(tr, value, index)
 }
 
-// Pop the next item from the queue. Cannot be composed with other functions in a single transaction.
+// Pop the next item from the queue. Cannot be composed with other functions
+// in a single transaction.
 func (queue *Queue) Pop(db fdb.Database) (value []byte, ok bool) {
 
 	if queue.HighContention {
@@ -107,6 +129,11 @@ func (queue *Queue) Pop(db fdb.Database) (value []byte, ok bool) {
 	return
 }
 
+// pushAt inserts item in the queue at (index, randomId) position. Items
+// pushed at the same time will have the same index, and so their ordering
+// will be random
+// This makes pushes fast and usually conflict free (unless the queue becomes)
+// empty during the push
 func (queue *Queue) pushAt(tr fdb.Transaction, value []byte, index int64) {
 	key := queue.queueItem.Pack(tuple.Tuple{index, nextRandom()})
 	val := encodeValue(value)
@@ -114,8 +141,9 @@ func (queue *Queue) pushAt(tr fdb.Transaction, value []byte, index int64) {
 	tr.Set(fdb.Key(key), val)
 }
 
-// popSimple does not attempt to avoid conflicts
-// if many clients are trying to pop simultaneously, only one will be able to succeed at a time.
+// popSimple gets the message without trying to avoid conflicts
+// if many clients are trying to pop simultaneously, only one will be able to
+// succeed at a time.
 func (queue *Queue) popSimple(tr fdb.Transaction) (value []byte, ok bool) {
 	if kv, ok := queue.getFirstItem(tr); ok {
 		tr.Clear(kv.Key)
@@ -136,6 +164,17 @@ func (queue *Queue) addConflictedPop(tr fdb.Transaction, forced bool) (val []byt
 	_ = tr.Get(fdb.Key(key))
 	tr.Set(fdb.Key(key), []byte(""))
 	return key
+}
+
+func errIsCommitFailure(e error) bool {
+	if nil != e {
+		if f, ok := e.(fdb.Error); ok {
+			if f == fdb.Error(1020) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // popHighContention attempts to avoid collisions by registering
@@ -160,10 +199,15 @@ func (queue *Queue) popHighContention(db fdb.Database) (value []byte, ok bool) {
 		value, ok := queue.popSimple(tr)
 
 		// if we managed to commit without collisions
-		if err := tr.Commit().GetWithError(); err == nil {
 
+		if err := tr.Commit().GetWithError(); err == nil {
 			return value, ok
+		} else {
+			if !errIsCommitFailure(err) {
+				panic(err)
+			}
 		}
+
 	}
 
 	if err := tr.Commit().GetWithError(); err != nil {
@@ -281,6 +325,7 @@ func nextRandom() []byte {
 	}
 }
 
+// Empty returns true is queue does not have any messages
 func (queue *Queue) Empty(tr fdb.Transaction) bool {
 	_, ok := queue.getFirstItem(tr)
 	return ok == false
