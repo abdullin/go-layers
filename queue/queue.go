@@ -22,8 +22,8 @@ import (
 	"crypto/rand"
 	"fmt"
 	"github.com/FoundationDB/fdb-go/fdb"
+	"github.com/FoundationDB/fdb-go/fdb/subspace"
 	"github.com/FoundationDB/fdb-go/fdb/tuple"
-	"github.com/happypancake/go-layers/subspace"
 	"time"
 )
 
@@ -38,16 +38,16 @@ type Queue struct {
 // New queue is created within a given subspace
 func New(sub subspace.Subspace, highContention bool) Queue {
 
-	conflict := sub.Item(tuple.Tuple{"conflict"})
-	pop := sub.Item(tuple.Tuple{"pop"})
-	item := sub.Item(tuple.Tuple{"item"})
+	conflict := sub.Sub("conflict")
+	pop := sub.Sub("pop")
+	item := sub.Sub("item")
 
 	return Queue{sub, highContention, pop, conflict, item}
 }
 
 // Clear all items from the queue
 func (queue *Queue) Clear(tr fdb.Transaction) {
-	tr.ClearRange(queue.Subspace.FullRange())
+	tr.ClearRange(queue.Subspace)
 }
 
 // Peek at value of the next item without popping it
@@ -78,11 +78,11 @@ type KeyReader interface {
 // to make private
 func (queue *Queue) GetNextIndex(tr KeyReader, sub subspace.Subspace) int64 {
 
-	r := sub.Range(tuple.Tuple{})
+	start, end := sub.FDBRangeKeys()
 
-	key := tr.GetKey(fdb.LastLessThan(r.End)).GetOrPanic()
+	key := tr.GetKey(fdb.LastLessThan(end)).GetOrPanic()
 
-	if i := bytes.Compare(key, []byte(r.BeginKey())); i < 0 {
+	if i := bytes.Compare(key, []byte(start.FDBKey())); i < 0 {
 		return 0
 	}
 
@@ -169,7 +169,7 @@ func (queue *Queue) addConflictedPop(tr fdb.Transaction, forced bool) (val []byt
 func errIsCommitFailure(e error) bool {
 	if nil != e {
 		if f, ok := e.(fdb.Error); ok {
-			if f == fdb.Error(1020) {
+			if f.Code == 1020 {
 				return true
 			}
 		}
@@ -218,7 +218,12 @@ func (queue *Queue) popHighContention(db fdb.Database) (value []byte, ok bool) {
 		waitKey = queue.addConflictedPop(tr, true)
 	}
 
-	randId := queue.conflictedPop.MustUnpack(waitKey)[1].([]byte)
+	t, err := queue.conflictedPop.Unpack(fdb.Key(waitKey))
+	if err != nil {
+		panic(err)
+	}
+
+	randId := t[1].([]byte)
 	// The result of the pop will be stored at this key once it has been fulfilled
 	resultKey := queue.conflictedItemKey(randId)
 
@@ -256,13 +261,11 @@ func (queue *Queue) popHighContention(db fdb.Database) (value []byte, ok bool) {
 }
 
 func (queue *Queue) getWaitingPops(tr fdb.Transaction, numPops int) fdb.RangeResult {
-	r := queue.conflictedPop.FullRange()
-	return tr.GetRange(r, fdb.RangeOptions{Limit: numPops})
+	return tr.GetRange(queue.conflictedPop, fdb.RangeOptions{Limit: numPops})
 }
 
 func (queue *Queue) getItems(tr fdb.Transaction, numPops int) fdb.RangeResult {
-	r := queue.queueItem.FullRange()
-	return tr.GetRange(r, fdb.RangeOptions{Limit: numPops})
+	return tr.GetRange(queue.queueItem, fdb.RangeOptions{Limit: numPops})
 }
 
 func minLength(a, b []fdb.KeyValue) int {
@@ -290,8 +293,12 @@ func (queue *Queue) fulfilConflictedPops(db fdb.Database) bool {
 		for i := 0; i < min; i++ {
 			pop, k, v := pops[i], items[i].Key, items[i].Value
 
-			key := queue.conflictedPop.MustUnpack(pop.Key)
-			storageKey := queue.conflictedItemKey(key[1].([]byte))
+			tuple, err := queue.conflictedPop.Unpack(pop.Key)
+			if err != nil {
+				panic(err)
+			}
+
+			storageKey := queue.conflictedItemKey(tuple[1].([]byte))
 			tr.Set(fdb.Key(storageKey), v)
 			_ = tr.Get(k)
 			_ = tr.Get(pop.Key)
@@ -332,7 +339,7 @@ func (queue *Queue) Empty(tr fdb.Transaction) bool {
 }
 
 func (queue *Queue) getFirstItem(tr fdb.Transaction) (kv fdb.KeyValue, ok bool) {
-	r := queue.queueItem.FullRange()
+	r := queue.queueItem
 	opt := fdb.RangeOptions{Limit: 1}
 
 	if kvs := tr.GetRange(r, opt).GetSliceOrPanic(); len(kvs) == 1 {
